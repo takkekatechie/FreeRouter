@@ -5,7 +5,12 @@ import type {
   ChargebackReport,
   ChatRequest,
   ChatResponse,
+  HealthStatus,
+  ModelPricingEntry,
+  ProviderHealth,
   RequestContext,
+  RouterEventMap,
+  RouterMetrics,
   SpendForecast,
   SpendRecord,
   SpendSummary,
@@ -13,6 +18,7 @@ import type {
 } from './types.js'
 import type { RouterConfig } from './config.js'
 import type { BaseProvider } from './providers/base-provider.js'
+import type { FreeRouterPlugin } from './plugin.js'
 import { ProviderRegistry } from './providers/registry.js'
 import { KeyManager } from './security/key-manager.js'
 import { AuditLogger } from './security/audit-logger.js'
@@ -22,9 +28,12 @@ import { SpendTracker } from './finops/spend-tracker.js'
 import { SpendForecaster } from './finops/spend-forecaster.js'
 import { ChargebackEngine } from './finops/chargeback.js'
 import { RateLimiter } from './finops/rate-limiter.js'
+import type { RateLimiterLike } from './finops/rate-limiter.js'
 import { PolicyEngine } from './finops/policy-engine.js'
 import { calculateCost } from './finops/cost-calculator.js'
 import { loadConfigFile, loadConfigFromEnv, mergeConfigs, validateConfigKeys } from './config-loader.js'
+import { TypedEventEmitter } from './router-events.js'
+import { MetricsCollector } from './metrics-collector.js'
 
 export class FreeRouter {
   private readonly registry: ProviderRegistry
@@ -35,10 +44,24 @@ export class FreeRouter {
   private readonly tracker: SpendTracker
   private readonly forecaster: SpendForecaster
   private readonly chargeback: ChargebackEngine
-  private readonly rateLimiter: RateLimiter | undefined
+  private readonly rateLimiter: RateLimiterLike | undefined
   private readonly policyEngine: PolicyEngine
   private readonly config: RouterConfig
   private readonly policies: BudgetPolicy[]
+
+  // Hot-reload state
+  private readonly events = new TypedEventEmitter<RouterEventMap>()
+  private readonly inflight = new Map<string, Set<Promise<unknown>>>()
+  private readonly runtimeBlocked = new Set<string>()
+  // All providers ever seen (registry + removed) — used by healthCheck
+  private readonly allKnownProviders = new Set<string>()
+
+  // Metrics & health
+  private readonly metricsCollector = new MetricsCollector()
+  private readonly startTime = Date.now()
+
+  // Plugin dedup
+  private readonly installedPlugins = new Set<string>()
 
   // ── Static factory methods ────────────────────────────────
 
@@ -128,6 +151,11 @@ export class FreeRouter {
       this.policies,
       config.pricingOverrides ?? {},
     )
+
+    // Seed known providers from the initial registry
+    for (const name of this.registry.list()) {
+      this.allKnownProviders.add(name.toLowerCase())
+    }
   }
 
   // ── Key management ────────────────────────────────────────────
@@ -147,6 +175,84 @@ export class FreeRouter {
     this.audit.keyDeleted(userId, provider)
   }
 
+  // ── Hot-reload: Providers ─────────────────────────────────────
+
+  /**
+   * Subscribe to router lifecycle events.
+   * Returns an unsubscribe function.
+   */
+  on<K extends keyof RouterEventMap>(
+    event: K,
+    handler: (payload: RouterEventMap[K]) => void,
+  ): () => void {
+    return this.events.on(event, handler)
+  }
+
+  /**
+   * Register a new provider (or re-enable a previously removed one) at runtime.
+   * Existing spend records and keys are unaffected.
+   */
+  async addProvider(
+    name: string,
+    factory: () => BaseProvider,
+    prefixes: string[] = [],
+    pricingMap?: Record<string, ModelPricingEntry>,
+  ): Promise<void> {
+    const key = name.toLowerCase()
+    this.runtimeBlocked.delete(key)
+    this.registry.registerFactory(key, factory, prefixes)
+    this.allKnownProviders.add(key)
+    if (pricingMap !== undefined) {
+      for (const [modelId, pricing] of Object.entries(pricingMap)) {
+        this.registry.addModelPricing(key, modelId, pricing)
+      }
+    }
+    this.audit.providerAdded(key)
+    this.events.emit('provider:added', { providerName: key, timestamp: Date.now() })
+  }
+
+  /**
+   * Remove a provider at runtime.
+   * By default, drains all in-flight requests for that provider before removing.
+   * Pass { force: true } to skip draining.
+   *
+   * Spend records, keys, and FinOps state are never deleted.
+   */
+  async removeProvider(name: string, opts: { force?: boolean } = {}): Promise<void> {
+    const key = name.toLowerCase()
+    if (!opts.force) {
+      const pending = this.inflight.get(key)
+      if (pending !== undefined && pending.size > 0) {
+        await Promise.allSettled([...pending])
+      }
+    }
+    this.runtimeBlocked.add(key)
+    this.registry.unregister(key)
+    this.audit.providerRemoved(key)
+    this.events.emit('provider:removed', { providerName: key, timestamp: Date.now() })
+  }
+
+  // ── Hot-reload: Models ────────────────────────────────────────
+
+  /** Register a new model (and pricing) on an existing provider at runtime. */
+  addModel(providerName: string, modelId: string, pricing: ModelPricingEntry): void {
+    const key = providerName.toLowerCase()
+    this.registry.addModelPricing(key, modelId, pricing)
+    this.audit.modelAdded(key, modelId)
+    this.events.emit('model:added', { providerName: key, modelId, timestamp: Date.now() })
+  }
+
+  /**
+   * Disallow routing to a model at runtime.
+   * Future requests for this model throw. Historical spend records remain.
+   */
+  removeModel(providerName: string, modelId: string): void {
+    const key = providerName.toLowerCase()
+    this.registry.removeModelPricing(key, modelId)
+    this.audit.modelRemoved(key, modelId)
+    this.events.emit('model:removed', { providerName: key, modelId, timestamp: Date.now() })
+  }
+
   // ── Chat (non-streaming) ──────────────────────────────────────
 
   async chat(userId: string, req: ChatRequest, context: RequestContext = {}): Promise<ChatResponse> {
@@ -162,6 +268,7 @@ export class FreeRouter {
         ...(context.teamId !== undefined && { teamId: context.teamId }),
         ...(context.orgId !== undefined && { orgId: context.orgId }),
       })
+      this.metricsCollector.recordRequest('unknown', 0, 0, 'blocked')
       throw new Error(`[FreeRouter] Request blocked: ${decision.blockedReason}`)
     }
 
@@ -171,15 +278,34 @@ export class FreeRouter {
       this.config.defaultProvider,
     )
 
+    if (this.runtimeBlocked.has(provider.name.toLowerCase())) {
+      throw new Error(`[FreeRouter] Provider "${provider.name}" has been removed.`)
+    }
+
     const hmacKey = this.keyManager.deriveHmacKey(userId)
     const { contentHash } = this.signer.sign({ signingKey: hmacKey, userId, model: modelName, messages: req.messages })
 
+    const start = Date.now()
     let response!: ChatResponse
-    await this.keyManager.withKey(userId, provider.name, async apiKey => {
+    const providerKey = provider.name.toLowerCase()
+
+    const requestPromise = this.keyManager.withKey(userId, provider.name, async apiKey => {
       response = await provider.chat(effectiveReq, apiKey)
     })
 
+    this.trackInflight(providerKey, requestPromise)
+    try {
+      await requestPromise
+      this.metricsCollector.recordRequest(providerKey, Date.now() - start, 0, 'success')
+    } catch (err) {
+      this.metricsCollector.recordRequest(providerKey, Date.now() - start, 0, 'failure')
+      throw err
+    } finally {
+      this.untrackInflight(providerKey, requestPromise)
+    }
+
     const record = this.buildRecord(userId, provider.name, modelName, response, context)
+    this.metricsCollector.recordRequest(providerKey, response.latencyMs, record.costUsd, 'success')
     this.tracker.recordSpend(record)
     this.config.onRequestComplete?.(record)
 
@@ -217,6 +343,7 @@ export class FreeRouter {
         ...(context.teamId !== undefined && { teamId: context.teamId }),
         ...(context.orgId !== undefined && { orgId: context.orgId }),
       })
+      this.metricsCollector.recordRequest('unknown', 0, 0, 'blocked')
       throw new Error(`[FreeRouter] Request blocked: ${decision.blockedReason}`)
     }
 
@@ -226,16 +353,34 @@ export class FreeRouter {
       this.config.defaultProvider,
     )
 
+    if (this.runtimeBlocked.has(provider.name.toLowerCase())) {
+      throw new Error(`[FreeRouter] Provider "${provider.name}" has been removed.`)
+    }
+
     const hmacKey = this.keyManager.deriveHmacKey(userId)
     const { contentHash } = this.signer.sign({ signingKey: hmacKey, userId, model: modelName, messages: req.messages })
 
+    const start = Date.now()
+    const providerKey = provider.name.toLowerCase()
+
     // Collect chunks inside callback (yield cannot cross async callback boundary)
     const chunks: StreamChunk[] = []
-    await this.keyManager.withKey(userId, provider.name, async apiKey => {
+    const requestPromise = this.keyManager.withKey(userId, provider.name, async apiKey => {
       for await (const chunk of provider.chatStream(effectiveReq, apiKey)) {
         chunks.push(chunk)
       }
     })
+
+    this.trackInflight(providerKey, requestPromise)
+    try {
+      await requestPromise
+      this.metricsCollector.recordRequest(providerKey, Date.now() - start, 0, 'success')
+    } catch (err) {
+      this.metricsCollector.recordRequest(providerKey, Date.now() - start, 0, 'failure')
+      throw err
+    } finally {
+      this.untrackInflight(providerKey, requestPromise)
+    }
 
     let finalChunk: StreamChunk | undefined
     for (const chunk of chunks) {
@@ -286,7 +431,63 @@ export class FreeRouter {
 
   listProviders(): string[] { return this.registry.list() }
 
+  /**
+   * Install a plugin. Duplicate installs (by name) are silently skipped.
+   * Returns `this` for chaining.
+   */
+  use(plugin: FreeRouterPlugin): this {
+    if (this.installedPlugins.has(plugin.name)) {
+      process.stderr.write(`[FreeRouter] Plugin "${plugin.name}" already installed — skipping.\n`)
+      return this
+    }
+    plugin.install(this)
+    this.installedPlugins.add(plugin.name)
+    return this
+  }
+
+  // ── Health & Metrics ──────────────────────────────────────────
+
+  healthCheck(): HealthStatus {
+    // Combine active providers and known-but-removed providers for full picture
+    const activeNames = new Set(this.registry.list().map(n => n.toLowerCase()))
+    const allNames = new Set([...activeNames, ...this.allKnownProviders])
+    const providers: ProviderHealth[] = [...allNames].map(name => ({
+      name,
+      available: activeNames.has(name) && !this.runtimeBlocked.has(name),
+    }))
+
+    const available = providers.filter(p => p.available).length
+    let status: HealthStatus['status']
+    if (available === 0) status = 'unhealthy'
+    else if (available < providers.length) status = 'degraded'
+    else status = 'healthy'
+
+    return {
+      status,
+      providers,
+      uptime: Date.now() - this.startTime,
+      timestamp: Date.now(),
+    }
+  }
+
+  metrics(): RouterMetrics {
+    return this.metricsCollector.snapshot()
+  }
+
   // ── Private helpers ───────────────────────────────────────────
+
+  private trackInflight(providerKey: string, promise: Promise<unknown>): void {
+    let set = this.inflight.get(providerKey)
+    if (set === undefined) {
+      set = new Set()
+      this.inflight.set(providerKey, set)
+    }
+    set.add(promise)
+  }
+
+  private untrackInflight(providerKey: string, promise: Promise<unknown>): void {
+    this.inflight.get(providerKey)?.delete(promise)
+  }
 
   private buildRecord(
     userId: string,
@@ -295,8 +496,9 @@ export class FreeRouter {
     response: ChatResponse,
     context: RequestContext,
   ): SpendRecord {
-    const { provider } = this.registry.resolveFromModel(`${providerName}/${modelName}`, providerName)
-    const costUsd = calculateCost(response.usage, provider.pricing(modelName))
+    const pricing = this.registry.getModelPricing(providerName, modelName)
+      ?? this.registry.resolveFromModel(`${providerName}/${modelName}`, providerName).provider.pricing(modelName)
+    const costUsd = calculateCost(response.usage, pricing)
     return {
       userId,
       ...(context.orgId !== undefined && { orgId: context.orgId }),
@@ -318,8 +520,9 @@ export class FreeRouter {
     context: RequestContext,
   ): SpendRecord {
     const usage = finalChunk.usage!
-    const { provider } = this.registry.resolveFromModel(`${providerName}/${modelName}`, providerName)
-    const costUsd = calculateCost(usage, provider.pricing(modelName))
+    const pricing = this.registry.getModelPricing(providerName, modelName)
+      ?? this.registry.resolveFromModel(`${providerName}/${modelName}`, providerName).provider.pricing(modelName)
+    const costUsd = calculateCost(usage, pricing)
     return {
       userId,
       ...(context.orgId !== undefined && { orgId: context.orgId }),

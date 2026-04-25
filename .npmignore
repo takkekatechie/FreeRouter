@@ -1,0 +1,12 @@
+src/
+tests/
+demo.ts
+*.config.ts
+*.config.yaml
+*.config.yml
+freerouter.config.json
+freerouter.config.yaml
+tsconfig.json
+vitest.config.ts
+.claude/
+CHANGELOG.md

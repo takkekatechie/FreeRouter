@@ -114,6 +114,22 @@ export class AuditLogger {
   }): void {
     this.log({ action: 'policy:violated', ...params })
   }
+
+  providerAdded(providerName: string): void {
+    this.log({ action: 'provider:added', userId: 'system', provider: providerName })
+  }
+
+  providerRemoved(providerName: string): void {
+    this.log({ action: 'provider:removed', userId: 'system', provider: providerName })
+  }
+
+  modelAdded(providerName: string, modelId: string): void {
+    this.log({ action: 'model:added', userId: 'system', provider: providerName, model: modelId })
+  }
+
+  modelRemoved(providerName: string, modelId: string): void {
+    this.log({ action: 'model:removed', userId: 'system', provider: providerName, model: modelId })
+  }
 }
 
 export type { AuditAction, AuditEntry, AuditSink }

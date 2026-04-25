@@ -4,7 +4,7 @@ const ALGO = 'aes-256-gcm'
 const IV_LENGTH = 12   // GCM recommended
 const TAG_LENGTH = 16
 
-interface StoredKey {
+export interface StoredKey {
   ciphertext: Buffer
   iv: Buffer
   tag: Buffer

@@ -2,7 +2,7 @@ import type { BudgetPolicy, ChatRequest, PolicyDecision, RequestContext } from '
 import type { ProviderRegistry } from '../providers/registry.js'
 import type { SpendTracker } from './spend-tracker.js'
 import type { SpendForecaster } from './spend-forecaster.js'
-import type { RateLimiter } from './rate-limiter.js'
+import type { RateLimiterLike } from './rate-limiter.js'
 import { estimateCost, estimatePromptTokens } from './cost-calculator.js'
 
 export class PolicyEngine {
@@ -10,7 +10,7 @@ export class PolicyEngine {
     private readonly registry: ProviderRegistry,
     private readonly tracker: SpendTracker,
     private readonly forecaster: SpendForecaster | undefined,
-    private readonly rateLimiter: RateLimiter | undefined,
+    private readonly rateLimiter: RateLimiterLike | undefined,
     private readonly policies: BudgetPolicy[],
     private readonly pricingOverrides: Record<string, { input: number; output: number }> = {},
   ) {}
@@ -21,7 +21,9 @@ export class PolicyEngine {
     context: RequestContext,
   ): PolicyDecision {
     const { provider, modelName } = this.registry.resolveFromModel(req.model)
-    const originalModel = modelName
+    // Preserve the full original model string (including provider/ prefix if present)
+    // so the router can re-resolve the provider after policy evaluation.
+    const originalModel = req.model
 
     // ── 1. Rate limit check ──────────────────────────────────
     if (this.rateLimiter !== undefined) {

@@ -1,5 +1,6 @@
 import type { BaseProvider } from './base-provider.js'
 import type { ProviderToggle } from '../config.js'
+import type { ModelPricingEntry } from '../types.js'
 import { GoogleProvider } from './google.js'
 import { OpenAIProvider } from './openai.js'
 import { AnthropicProvider } from './anthropic.js'
@@ -34,6 +35,8 @@ export class ProviderRegistry {
   private readonly factories = new Map<string, ProviderFactory>()
   private readonly blocked: Set<string>
   private readonly prefixMap = new Map<string, string>() // prefix → providerName
+  private readonly disallowedModels = new Map<string, Set<string>>() // providerName → Set<modelId>
+  private readonly runtimePricing = new Map<string, Map<string, ModelPricingEntry>>() // providerName → modelId → pricing
 
   constructor(
     blockedProviders: string[] = [],
@@ -84,6 +87,59 @@ export class ProviderRegistry {
     }
   }
 
+  /**
+   * Remove a provider and all its prefix mappings from the registry.
+   * Historical spend records and key manager entries are unaffected.
+   */
+  unregister(name: string): void {
+    const key = name.toLowerCase()
+    this.providers.delete(key)
+    this.factories.delete(key)
+    // Remove prefix entries pointing to this provider
+    for (const [prefix, providerName] of this.prefixMap) {
+      if (providerName === key) this.prefixMap.delete(prefix)
+    }
+  }
+
+  /** Register or update a model-level pricing override for a provider */
+  addModelPricing(providerName: string, modelId: string, pricing: ModelPricingEntry): void {
+    const key = providerName.toLowerCase()
+    let modelMap = this.runtimePricing.get(key)
+    if (modelMap === undefined) {
+      modelMap = new Map()
+      this.runtimePricing.set(key, modelMap)
+    }
+    modelMap.set(modelId.toLowerCase(), pricing)
+    // Remove from disallowed if re-adding a previously removed model
+    this.disallowedModels.get(key)?.delete(modelId.toLowerCase())
+  }
+
+  /**
+   * Disallow routing to a specific model.
+   * Existing spend records are unaffected; future requests for this model throw.
+   */
+  removeModelPricing(providerName: string, modelId: string): void {
+    const key = providerName.toLowerCase()
+    const modelLower = modelId.toLowerCase()
+    this.runtimePricing.get(key)?.delete(modelLower)
+    let disallowed = this.disallowedModels.get(key)
+    if (disallowed === undefined) {
+      disallowed = new Set()
+      this.disallowedModels.set(key, disallowed)
+    }
+    disallowed.add(modelLower)
+  }
+
+  /** Check if a model is still allowed for routing */
+  isModelAllowed(providerName: string, modelId: string): boolean {
+    return !(this.disallowedModels.get(providerName.toLowerCase())?.has(modelId.toLowerCase()) ?? false)
+  }
+
+  /** Get runtime pricing override for a model (if registered via addModelPricing) */
+  getModelPricing(providerName: string, modelId: string): ModelPricingEntry | undefined {
+    return this.runtimePricing.get(providerName.toLowerCase())?.get(modelId.toLowerCase())
+  }
+
   get(name: string): BaseProvider {
     const key = name.toLowerCase()
 
@@ -116,19 +172,29 @@ export class ProviderRegistry {
     if (slashIdx > 0) {
       const providerName = model.slice(0, slashIdx)
       const modelName = model.slice(slashIdx + 1)
-      return { provider: this.get(providerName), modelName }
+      const provider = this.get(providerName)
+      if (!this.isModelAllowed(providerName, modelName)) {
+        throw new Error(`[FreeRouter] Model "${modelName}" has been removed from provider "${providerName}".`)
+      }
+      return { provider, modelName }
     }
 
     // Heuristic prefix match
     const modelLower = model.toLowerCase()
     for (const [prefix, providerName] of this.prefixMap) {
       if (modelLower.startsWith(prefix)) {
+        if (!this.isModelAllowed(providerName, model)) {
+          throw new Error(`[FreeRouter] Model "${model}" has been removed from provider "${providerName}".`)
+        }
         return { provider: this.get(providerName), modelName: model }
       }
     }
 
     // Fall back to configured default
     if (defaultProvider !== undefined) {
+      if (!this.isModelAllowed(defaultProvider, model)) {
+        throw new Error(`[FreeRouter] Model "${model}" has been removed from provider "${defaultProvider}".`)
+      }
       return { provider: this.get(defaultProvider), modelName: model }
     }
 

@@ -7,11 +7,18 @@ interface Bucket {
   windowStartMs: number
 }
 
+/** Common interface for local and distributed rate limiters */
+export interface RateLimiterLike {
+  check(key: string, estimatedTokens?: number): { allowed: boolean; reason?: string }
+  consume(key: string, tokensUsed?: number): void
+  prune(): void
+}
+
 /**
  * Token-bucket rate limiter.
  * Supports per-key buckets (userId, teamId, etc.) with configurable burst.
  */
-export class RateLimiter {
+export class RateLimiter implements RateLimiterLike {
   private readonly buckets = new Map<string, Bucket>()
   private readonly config: Required<Omit<RateLimitConfig, 'scope'>>
 

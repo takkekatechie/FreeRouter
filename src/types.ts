@@ -189,6 +189,10 @@ export type AuditAction =
   | 'budget:exceeded'
   | 'forecast:at-risk'
   | 'policy:violated'
+  | 'provider:added'
+  | 'provider:removed'
+  | 'model:added'
+  | 'model:removed'
 
 export interface AuditEntry {
   timestamp: number
@@ -209,4 +213,78 @@ export interface AuditEntry {
 
 export interface AuditSink {
   write(entry: AuditEntry): void | Promise<void>
+}
+
+// ─────────────────────────────────────────
+// Hot-reload — Provider / Model lifecycle
+// ─────────────────────────────────────────
+
+/** Pricing for a single model: USD per 1M tokens */
+export interface ModelPricingEntry {
+  input: number
+  output: number
+}
+
+export interface ProviderLifecycleEvent {
+  providerName: string
+  timestamp: number
+}
+
+export interface ModelLifecycleEvent {
+  providerName: string
+  modelId: string
+  timestamp: number
+}
+
+export type RouterEventMap = {
+  'provider:added': ProviderLifecycleEvent
+  'provider:removed': ProviderLifecycleEvent
+  'model:added': ModelLifecycleEvent
+  'model:removed': ModelLifecycleEvent
+}
+
+// ─────────────────────────────────────────
+// Health & Metrics
+// ─────────────────────────────────────────
+
+export interface ProviderHealth {
+  name: string
+  /** false if runtime-blocked or unregistered */
+  available: boolean
+  /** Epoch ms of last failed request */
+  lastErrorAt?: number
+}
+
+export interface HealthStatus {
+  status: 'healthy' | 'degraded' | 'unhealthy'
+  providers: ProviderHealth[]
+  /** Milliseconds since FreeRouter was instantiated */
+  uptime: number
+  timestamp: number
+}
+
+export interface LatencyBuckets {
+  p50: number
+  p95: number
+  p99: number
+}
+
+export interface RouterMetrics {
+  requests: {
+    total: number
+    succeeded: number
+    failed: number
+    blocked: number
+  }
+  latencyMs: LatencyBuckets
+  errorRate: number
+  spend: {
+    totalUsd: number
+    totalTokens: number
+  }
+  byProvider: Record<string, {
+    requests: number
+    errors: number
+    totalCostUsd: number
+  }>
 }
