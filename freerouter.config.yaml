@@ -1,0 +1,62 @@
+# FreeRouter Configuration
+# All fields are optional except where noted.
+
+defaultProvider: google
+defaultModel: gemini-2.0-flash
+promptInjectionGuard: true
+requestSigning: false
+maxInputLength: 100000
+
+blockedProviders:
+  - deepseek
+  - qwen
+  - zhipu
+  - baichuan
+  - minimax
+
+providers:
+  google:    { enabled: true }
+  openai:    { enabled: true }
+  anthropic: { enabled: true }
+  mistral:   { enabled: true }
+  groq:
+    enabled: true
+    routingPrefixes: [llama, gemma, whisper]
+
+rateLimit:
+  requestsPerMinute: 60
+  tokensPerMinute: 200000
+  burstAllowance: 0.2
+
+budgets:
+  - id: org-monthly
+    scope: { type: org, orgId: acme-corp }
+    window: monthly
+    maxSpendUsd: 500.00
+    onLimitReached: warn
+    alertThresholds: [50, 80, 95]
+
+  - id: team-daily
+    scope: { type: team, orgId: acme-corp, teamId: engineering }
+    window: daily
+    maxSpendUsd: 25.00
+    onLimitReached: downgrade
+    fallbackModel: gemini-2.0-flash-lite
+    priority: 10
+
+  - id: user-hourly
+    scope: { type: user, userId: default }
+    window: hourly
+    maxSpendUsd: 2.00
+    maxRequests: 100
+    onLimitReached: block
+    modelCaps:
+      gemini-2.5-pro: { maxSpendUsd: 1.00 }
+      gpt-4o: { maxSpendUsd: 0.50 }
+
+audit:
+  enabled: true
+
+pricingOverrides:
+  gemini-2.0-flash: { input: 0.075, output: 0.30 }
+  gemini-2.5-pro:   { input: 1.25,  output: 10.00 }

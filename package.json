@@ -1,0 +1,54 @@
+{
+  "name": "freerouter",
+  "version": "0.1.0",
+  "description": "Embeddable BYOK LLM router with enterprise FinOps, sub-5ms overhead, and AES-256-GCM key security",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs",
+      "types": "./dist/index.d.ts"
+    },
+    "./providers": {
+      "import": "./dist/providers/index.js",
+      "require": "./dist/providers/index.cjs",
+      "types": "./dist/providers/index.d.ts"
+    },
+    "./security": {
+      "import": "./dist/security/index.js",
+      "require": "./dist/security/index.cjs",
+      "types": "./dist/security/index.d.ts"
+    },
+    "./finops": {
+      "import": "./dist/finops/index.js",
+      "require": "./dist/finops/index.cjs",
+      "types": "./dist/finops/index.d.ts"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "bench": "tsx tests/bench.ts",
+    "demo": "tsx demo.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "tsup": "^8.0.2",
+    "vitest": "^1.4.0",
+    "tsx": "^4.7.2",
+    "@types/node": "^20.12.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["llm", "router", "byok", "finops", "openai", "anthropic", "gemini"],
+  "license": "MIT"
+}
