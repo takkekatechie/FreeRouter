@@ -10,6 +10,8 @@ import type {
 import type { SpendStore } from './finops/spend-store.js'
 import type { PricingSource } from './finops/pricing-source.js'
 import type { CostOptimizationConfig } from './finops/cost-router.js'
+import type { Rule, RulesMode } from './finops/rules-engine.js'
+import type { RulesSource } from './adapters/file-rules-source.js'
 
 export interface ProviderToggle {
   /** Set to false to skip registering this built-in provider. Default: true */
@@ -45,6 +47,16 @@ export interface PricingRefreshConfig {
    * How often to re-fetch from the source (ms).
    * Set to 0 or omit to disable automatic refresh (manual via `router.refreshPricing()`).
    * Recommended: 3_600_000 (1 hour).
+   */
+  intervalMs?: number
+}
+
+export interface RulesRefreshConfig {
+  /** Source of admin rules. Use `FileRulesSource` for hot-reloadable JSON. */
+  source: RulesSource
+  /**
+   * How often to re-fetch the rule set (ms).
+   * Set to 0 or omit to disable automatic refresh (manual via `router.refreshRules()`).
    */
   intervalMs?: number
 }
@@ -145,4 +157,23 @@ export interface RouterConfig {
   onRequestComplete?: (record: SpendRecord) => void
   /** Called after each successful pricing refresh with the number of models updated. */
   onPricingRefreshed?: (updatedCount: number) => void
+
+  /**
+   * Admin rules engine. Lets the admin override pure cost-based selection with
+   * value-based directives matched on user/org/team/dept/metadata/model.
+   *
+   * Rules can pin a specific model, override the cost-router strategy, or block.
+   * `mode` controls how rules interact with cost optimization.
+   */
+  rules?: { rules: Rule[]; mode: RulesMode }
+
+  /**
+   * Hot-reloadable source for admin rules. On each refresh tick, the in-memory
+   * rule set is replaced atomically. If both `rules` and `rulesRefresh` are set,
+   * the refresh source overwrites the programmatic rules on first fetch.
+   */
+  rulesRefresh?: RulesRefreshConfig
+
+  /** Called after each successful rules refresh with the number of rules loaded. */
+  onRulesRefreshed?: (count: number) => void
 }

@@ -9,7 +9,7 @@
 export { FreeRouter } from './router.js'
 
 // Config
-export type { RouterConfig, ProviderToggle, SpendPersistenceConfig, PricingRefreshConfig } from './config.js'
+export type { RouterConfig, ProviderToggle, SpendPersistenceConfig, PricingRefreshConfig, RulesRefreshConfig } from './config.js'
 
 // Config file loader
 export { loadConfigFile, loadConfigFromEnv, mergeConfigs, validateConfigKeys } from './config-loader.js'
@@ -71,6 +71,19 @@ export { HttpPricingSource, StaticPricingSource } from './finops/pricing-source.
 
 // FinOps — cost optimization
 export type { CostOptimizationConfig, CostStrategy } from './finops/cost-router.js'
+
+// FinOps — admin rules engine
+export { RulesEngine } from './finops/rules-engine.js'
+export type {
+  Rule,
+  RuleAction,
+  RuleMatch,
+  RuleDecision,
+  RulesConfig,
+  RulesMode,
+} from './finops/rules-engine.js'
+export { FileRulesSource } from './adapters/file-rules-source.js'
+export type { RulesSource } from './adapters/file-rules-source.js'
 
 // Extensibility
 export type { BaseProvider } from './providers/base-provider.js'

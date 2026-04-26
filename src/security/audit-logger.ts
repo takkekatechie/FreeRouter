@@ -66,6 +66,7 @@ export class AuditLogger {
     departmentId?: string
     orgId?: string
     policyId?: string
+    ruleId?: string
   }): void {
     this.log({ action: 'request:sent', ...params })
   }
@@ -78,6 +79,7 @@ export class AuditLogger {
     policyId?: string
     teamId?: string
     orgId?: string
+    ruleId?: string
   }): void {
     this.log({ action: 'request:blocked', ...params })
   }

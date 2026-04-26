@@ -253,6 +253,83 @@ The actual spend recorded in `SpendRecord` reflects the discounted cost, not the
 
 ---
 
+## Admin Rules Engine — Value-Based Overrides
+
+Pure cost-based routing isn't always right. The legal team should always use Sonnet regardless of cost. VIP customers should never be downgraded. Contractors should be blocked from GPT-4o. The rules engine lets the admin express these *value-based* directives that override cost optimization.
+
+Rules match on `userId` / `orgId` / `departmentId` / `teamId` / `metadata` / `priority` / model glob, and emit one of three actions: **pin** a specific model, override the **strategy** for the cost router, or **block** the request.
+
+```typescript
+import { FreeRouter } from 'freerouter'
+import { FileRulesSource } from 'freerouter/adapters'
+
+const router = new FreeRouter({
+  costOptimization: {
+    strategy: 'cheapest',
+    candidateModels: ['gemini-2.0-flash-lite', 'gpt-4o-mini'],
+  },
+  rules: {
+    mode: 'pin-wins',
+    rules: [
+      // Legal team always uses Sonnet — value over cost
+      { id: 'legal-quality', priority: 100,
+        match: { teamId: 'legal' },
+        action: { type: 'pin', model: 'anthropic/claude-3-5-sonnet-20241022' } },
+
+      // Code review use-case → highest-quality routing
+      { id: 'code-review',
+        match: { metadata: { useCase: 'code-review' } },
+        action: { type: 'strategy', strategy: 'performance' } },
+
+      // Contractors blocked from frontier models
+      { id: 'no-contractors',
+        match: { orgId: 'contractors', modelPattern: 'openai/gpt-4o' },
+        action: { type: 'block', reason: 'Frontier models restricted to employees' } },
+    ],
+  },
+})
+
+await router.chat('alice', { model: 'gemini-2.0-flash', messages }, { teamId: 'legal' })
+// → routes to claude-3-5-sonnet (rule overrides cheapest)
+```
+
+### Modes
+
+| Mode                | Pin behavior                                               | Strategy behavior                                  |
+| ------------------- | ---------------------------------------------------------- | -------------------------------------------------- |
+| `pin-wins`          | Pinned model is used directly; cost router bypassed.       | Cost router runs with the rule's strategy.         |
+| `narrow-candidates` | Cost router runs with `[pinned-model]` as the only choice. | Cost router runs with the rule's strategy.         |
+| `post-override`     | Cost router runs, then pin replaces the result.            | Cost router runs with the rule's strategy.         |
+
+### Hot-reloadable rules
+
+Drop a JSON file on disk; refresh on a schedule or on demand.
+
+```typescript
+new FreeRouter({
+  rules: { mode: 'pin-wins', rules: [] },
+  rulesRefresh: {
+    source: new FileRulesSource('./config/rules.json'),
+    intervalMs: 60_000, // poll every minute, or omit for manual refreshRules()
+  },
+  onRulesRefreshed: count => console.log(`Loaded ${count} rules`),
+})
+```
+
+### Runtime API
+
+```typescript
+router.setRule({ id: 'vip-alice', match: { userId: 'alice' },
+                 action: { type: 'strategy', strategy: 'performance' } })
+router.removeRule('vip-alice')
+router.listRules() // priority-sorted snapshot
+await router.refreshRules() // pull latest from rulesRefresh.source
+```
+
+Rules run **before** the cost router and **before** policy/budget evaluation. Each request that matches a rule carries the `ruleId` into the audit trail.
+
+---
+
 ## Live Pricing & Rate Limits
 
 Keep model pricing and rate-limit caps current without restarts.

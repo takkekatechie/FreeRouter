@@ -9,3 +9,5 @@ export type { RedisEvalClientLike } from './redis-rate-limiter.js'
 
 export { FileSpendStore } from './file-spend-store.js'
 export { FilePricingSource } from './file-pricing-source.js'
+export { FileRulesSource } from './file-rules-source.js'
+export type { RulesSource } from './file-rules-source.js'

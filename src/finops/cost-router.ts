@@ -43,8 +43,16 @@ export class CostRouter {
    * @param estimatedTokens  Rough prompt-token count (from estimatePromptTokens).
    * @param isRealtime       True when ChatRequest.priority === 'realtime'.
    */
-  selectModel(requestedModel: string, estimatedTokens: number, isRealtime = false): string {
-    if (this.config.strategy === 'performance') return requestedModel
+  selectModel(
+    requestedModel: string,
+    estimatedTokens: number,
+    isRealtime = false,
+    overrides?: { strategy?: CostStrategy; candidateModels?: string[] },
+  ): string {
+    const strategy = overrides?.strategy ?? this.config.strategy
+    const candidates = overrides?.candidateModels ?? this.config.candidateModels
+
+    if (strategy === 'performance') return requestedModel
     if (this.config.batchOnly === true && isRealtime) return requestedModel
 
     const basePricing = this.resolvePricing(requestedModel)
@@ -62,7 +70,7 @@ export class CostRouter {
     let bestModel = requestedModel
     let bestCost = baseCost
 
-    for (const candidate of this.config.candidateModels) {
+    for (const candidate of candidates) {
       if (candidate === requestedModel) continue
       const pricing = this.resolvePricing(candidate)
       if (pricing === undefined) continue

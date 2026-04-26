@@ -103,6 +103,10 @@ A `PricingSource` is a pluggable adapter that provides current model pricing and
 
 The `CostRouter` is a sub-millisecond, zero-I/O component that selects the cheapest model from a configured candidate list before the request is sent. It is purely arithmetic — it reads the provider's pricing from the in-memory registry and picks the lowest-input-cost model. It can be restricted to batch-priority requests only (`batchOnly: true`).
 
+### What is the RulesEngine?
+
+The `RulesEngine` lets the admin express *value-based* directives that override pure cost optimization. Rules match on user/org/team/department/metadata/priority/model glob and emit one of three actions: **pin** a specific model, override the cost-router **strategy**, or **block** the request. Rules run *before* the CostRouter and *before* policy/budget evaluation. Three modes (`pin-wins`, `narrow-candidates`, `post-override`) control how a matched rule interacts with cost optimization. Rules can be authored programmatically in `config.rules` or hot-reloaded from JSON via `FileRulesSource`. Each matched request carries the `ruleId` into the audit trail.
+
 ---
 
 ## 3. Feature Reference
@@ -141,6 +145,9 @@ The `CostRouter` is a sub-millisecond, zero-I/O component that selects the cheap
 | Cache-aware cost calculation | `TokenUsage.cachedPromptTokens` + `ModelPricingEntry.cachedInput` — actual cost reflects provider cache discounts. |
 | Live pricing refresh | `HttpPricingSource` / `FilePricingSource` + `pricingRefresh.intervalMs` keep rates current without restarts. |
 | Manual pricing override | `router.setPricingOverride(provider, model, pricing)` for runtime adjustments. |
+| Admin rules engine | Match on user/org/team/dept/metadata/model glob → pin a model, override strategy, or block. Three modes: `pin-wins`, `narrow-candidates`, `post-override`. |
+| Hot-reloadable rules | `FileRulesSource` polls JSON on disk; `router.refreshRules()`, `setRule()`, `removeRule()`, `listRules()` for runtime control. |
+| Audit trail integration | Matched rules carry their `ruleId` into every `request:sent` and `request:blocked` audit entry. |
 
 ### Observability
 
@@ -322,6 +329,75 @@ await router.chat('alice', {
   messages: [{ role: 'user', content: 'Summarise these 500 tickets...' }],
 })
 ```
+
+### Admin rules engine — value-based overrides
+
+When pure cost minimization is the wrong answer (legal must use Sonnet; VIP customers must never be downgraded; contractors must be blocked from frontier models), express it declaratively with rules.
+
+```typescript
+import { FreeRouter, FileRulesSource } from 'freerouter'
+
+const router = new FreeRouter({
+  costOptimization: {
+    strategy: 'cheapest',
+    candidateModels: ['gemini-2.0-flash-lite', 'gpt-4o-mini'],
+  },
+  rules: {
+    mode: 'pin-wins',  // 'pin-wins' | 'narrow-candidates' | 'post-override'
+    rules: [
+      // Legal team: quality over cost
+      { id: 'legal-quality', priority: 100,
+        match: { teamId: 'legal' },
+        action: { type: 'pin', model: 'anthropic/claude-3-5-sonnet-20241022' } },
+
+      // Code-review use case → never downgrade
+      { id: 'code-review',
+        match: { metadata: { useCase: 'code-review' } },
+        action: { type: 'strategy', strategy: 'performance' } },
+
+      // Contractors blocked from frontier models
+      { id: 'no-contractors',
+        match: { orgId: 'contractors', modelPattern: 'openai/gpt-4o' },
+        action: { type: 'block', reason: 'Frontier models restricted to employees' } },
+    ],
+  },
+})
+
+// Match metadata is propagated through to the audit entry as `ruleId`
+await router.chat('alice',
+  { model: 'gemini-2.0-flash', messages, metadata: { useCase: 'code-review' } },
+  { teamId: 'legal' }
+)
+```
+
+**Hot-reloadable rules from a JSON file:**
+
+```typescript
+new FreeRouter({
+  rules: { mode: 'pin-wins', rules: [] },
+  rulesRefresh: {
+    source: new FileRulesSource('./config/rules.json'),
+    intervalMs: 60_000, // poll every minute, or omit for manual refresh
+  },
+  onRulesRefreshed: count => console.log(`Loaded ${count} rules`),
+})
+
+// Or push rules at runtime:
+router.setRule({ id: 'vip-alice', match: { userId: 'alice' },
+                 action: { type: 'strategy', strategy: 'performance' } })
+router.removeRule('vip-alice')
+await router.refreshRules()
+```
+
+**Mode semantics:**
+
+| Mode                | Pin behavior                                           | Best for                                                 |
+| ------------------- | ------------------------------------------------------ | -------------------------------------------------------- |
+| `pin-wins`          | Pinned model used directly; cost router bypassed.      | Hard overrides (legal, compliance, VIP).                 |
+| `narrow-candidates` | Cost router runs with `[pinned]` as the only choice.   | "Use this model **if pricing makes sense**".             |
+| `post-override`     | Cost router runs, then pin replaces the result.        | Audit trail of what cost router *would have* picked.     |
+
+Rules run **before** cost optimization and **before** policy/budget evaluation. Each matched request's `ruleId` is written into the audit trail.
 
 ### Admin model blocking
 
@@ -595,7 +671,18 @@ export const handler = async (event: APIGatewayEvent) => {
 - `HttpPricingSource` polls an internal pricing service every hour. When Anthropic drops input prices, FreeRouter automatically recalculates estimated costs and spend records reflect the new rates on the next refresh — no restart, no redeploy.
 - `router.healthCheck()` exposes provider availability for your monitoring dashboard.
 
-### Use case 6 — Regulated industry audit trail
+### Use case 6 — Value-based routing for differentiated tiers
+
+**Scenario:** A consulting firm pays for LLM access across legal, marketing, and engineering teams. Pure cost minimization is the wrong default — the legal team's contract review must use the highest-quality model available regardless of cost, marketing's bulk content generation should hit the cheapest viable model, and a `code-review` use-case across any team must always use a frontier model. Additionally, contractor accounts must never be allowed to call frontier models.
+
+**FreeRouter fit:**
+- Configure the rules engine in `pin-wins` mode with declarative match→action rules. Legal team gets `pin: claude-3-5-sonnet`. Code-review metadata gets `strategy: performance`. Contractor org + frontier model glob gets `block`.
+- Marketing falls through to the configured `costOptimization.strategy: 'cheapest'` for free.
+- Rules live in a JSON file managed by the platform admin. `FileRulesSource` polls every 60s — admins update routing policy without a redeploy.
+- Every routed request carries the matched `ruleId` into the audit trail, so finance and compliance can prove which directive applied per request.
+- Rules can be added/removed at runtime via `router.setRule()` / `removeRule()` for incident response (e.g., temporary VIP routing during a customer escalation).
+
+### Use case 7 — Regulated industry audit trail
 
 **Scenario:** A healthcare SaaS must demonstrate to auditors that no patient data was sent to an unapproved model and that all API key operations are logged.
 

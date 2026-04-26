@@ -219,6 +219,8 @@ export interface AuditEntry {
   /** HMAC-SHA256 of request body — never raw content */
   requestHash?: string
   policyId?: string
+  /** ID of the admin rule that pinned/blocked/steered this request, if any. */
+  ruleId?: string
 }
 
 export interface AuditSink {

@@ -31,6 +31,7 @@ import { RateLimiter } from './finops/rate-limiter.js'
 import type { RateLimiterLike } from './finops/rate-limiter.js'
 import { PolicyEngine } from './finops/policy-engine.js'
 import { CostRouter } from './finops/cost-router.js'
+import { RulesEngine, type Rule, type RuleDecision } from './finops/rules-engine.js'
 import { calculateCost, estimatePromptTokens } from './finops/cost-calculator.js'
 import { loadConfigFile, loadConfigFromEnv, mergeConfigs, validateConfigKeys } from './config-loader.js'
 import { TypedEventEmitter } from './router-events.js'
@@ -48,6 +49,7 @@ export class FreeRouter {
   private readonly rateLimiter: RateLimiterLike | undefined
   private readonly policyEngine: PolicyEngine
   private readonly costRouter: CostRouter | undefined
+  private readonly rulesEngine: RulesEngine | undefined
   private readonly config: RouterConfig
   private readonly policies: BudgetPolicy[]
 
@@ -68,6 +70,7 @@ export class FreeRouter {
   // Persistence & refresh
   private spendFlushTimer: ReturnType<typeof setInterval> | undefined
   private pricingRefreshTimer: ReturnType<typeof setInterval> | undefined
+  private rulesRefreshTimer: ReturnType<typeof setInterval> | undefined
   private readonly exitHandlers = new Map<string, () => void>()
   private initPromise: Promise<void> | undefined
 
@@ -170,6 +173,12 @@ export class FreeRouter {
       ? new CostRouter(this.registry, config.costOptimization)
       : undefined
 
+    this.rulesEngine = config.rules !== undefined
+      ? new RulesEngine(config.rules)
+      : config.rulesRefresh !== undefined
+        ? new RulesEngine({ rules: [], mode: 'pin-wins' })
+        : undefined
+
     // Seed known providers from the initial registry
     for (const name of this.registry.list()) {
       this.allKnownProviders.add(name.toLowerCase())
@@ -232,6 +241,20 @@ export class FreeRouter {
         this.pricingRefreshTimer.unref?.()
       }
     }
+
+    // Load initial admin rules from the configured source
+    if (this.config.rulesRefresh !== undefined && this.rulesEngine !== undefined) {
+      await this.refreshRules()
+
+      const { intervalMs } = this.config.rulesRefresh
+      if (intervalMs !== undefined && intervalMs > 0) {
+        this.rulesRefreshTimer = setInterval(
+          () => { void this.refreshRules() },
+          intervalMs,
+        )
+        this.rulesRefreshTimer.unref?.()
+      }
+    }
   }
 
   /**
@@ -284,6 +307,47 @@ export class FreeRouter {
   }
 
   /**
+   * Re-fetch admin rules from the configured `rulesRefresh.source` and atomically
+   * replace the in-memory rule set. No-op when no source is configured.
+   */
+  async refreshRules(): Promise<void> {
+    const source = this.config.rulesRefresh?.source
+    if (source === undefined || this.rulesEngine === undefined) return
+
+    let rules: Rule[]
+    try {
+      rules = await source.fetch()
+    } catch (err) {
+      process.stderr.write(`[FreeRouter] RulesSource fetch failed: ${String(err)}\n`)
+      return
+    }
+
+    this.rulesEngine.replaceRules(rules)
+    this.config.onRulesRefreshed?.(rules.length)
+  }
+
+  /**
+   * Add or replace a single admin rule at runtime.
+   * Throws if the rules engine was not configured (no `rules` or `rulesRefresh`).
+   */
+  setRule(rule: Rule): void {
+    if (this.rulesEngine === undefined) {
+      throw new Error('[FreeRouter] Rules engine is not configured. Set `config.rules` or `config.rulesRefresh`.')
+    }
+    this.rulesEngine.upsertRule(rule)
+  }
+
+  /** Remove an admin rule by id. No-op if not configured or not found. */
+  removeRule(id: string): void {
+    this.rulesEngine?.removeRule(id)
+  }
+
+  /** Snapshot of the current admin rule list (for inspection). */
+  listRules(): readonly Rule[] {
+    return this.rulesEngine?.list() ?? []
+  }
+
+  /**
    * Graceful shutdown: flush spend records, clear all intervals, and remove
    * process signal listeners registered by this router instance.
    *
@@ -298,6 +362,10 @@ export class FreeRouter {
     if (this.pricingRefreshTimer !== undefined) {
       clearInterval(this.pricingRefreshTimer)
       this.pricingRefreshTimer = undefined
+    }
+    if (this.rulesRefreshTimer !== undefined) {
+      clearInterval(this.rulesRefreshTimer)
+      this.rulesRefreshTimer = undefined
     }
     await this.flushSpend()
     for (const [signal, handler] of this.exitHandlers) {
@@ -449,8 +517,23 @@ export class FreeRouter {
   async chat(userId: string, req: ChatRequest, context: RequestContext = {}): Promise<ChatResponse> {
     this.validator.validate(req)
 
-    // ── Cost optimization: select cheaper model before policy evaluation ──
-    const optimizedModel = this.selectCostOptimalModel(req)
+    // ── Admin rules: value-based overrides over pure cost optimization ──
+    const ruleDecision = this.rulesEngine?.evaluate(userId, req, context) ?? { kind: 'noop' as const }
+    if (ruleDecision.kind === 'block') {
+      this.audit.requestBlocked({
+        userId,
+        model: req.model,
+        reason: `Rule "${ruleDecision.ruleId}": ${ruleDecision.reason}`,
+        ruleId: ruleDecision.ruleId,
+        ...(context.teamId !== undefined && { teamId: context.teamId }),
+        ...(context.orgId !== undefined && { orgId: context.orgId }),
+      })
+      this.metricsCollector.recordRequest('unknown', 0, 0, 'blocked')
+      throw new Error(`[FreeRouter] Request blocked by rule "${ruleDecision.ruleId}": ${ruleDecision.reason}`)
+    }
+
+    // ── Cost optimization (mediated by rule mode) ──
+    const optimizedModel = this.applyRuleAndCost(req, ruleDecision)
     const effectiveReq: ChatRequest = optimizedModel !== req.model
       ? { ...req, model: optimizedModel }
       : req
@@ -462,6 +545,7 @@ export class FreeRouter {
         model: req.model,
         reason: decision.blockedReason ?? 'Policy blocked',
         ...(decision.policyId !== undefined && { policyId: decision.policyId }),
+        ...(ruleDecision.kind !== 'noop' && { ruleId: ruleDecision.ruleId }),
         ...(context.teamId !== undefined && { teamId: context.teamId }),
         ...(context.orgId !== undefined && { orgId: context.orgId }),
       })
@@ -516,6 +600,7 @@ export class FreeRouter {
       ...(context.departmentId !== undefined && { departmentId: context.departmentId }),
       ...(context.orgId !== undefined && { orgId: context.orgId }),
       ...(decision.policyId !== undefined && { policyId: decision.policyId }),
+      ...(ruleDecision.kind !== 'noop' && { ruleId: ruleDecision.ruleId }),
     })
 
     this.rateLimiter?.consume(context.teamId ?? userId, response.usage.totalTokens)
@@ -530,8 +615,23 @@ export class FreeRouter {
   async *chatStream(userId: string, req: ChatRequest, context: RequestContext = {}): AsyncGenerator<StreamChunk> {
     this.validator.validate(req)
 
-    // ── Cost optimization ──
-    const optimizedModel = this.selectCostOptimalModel(req)
+    // ── Admin rules ──
+    const ruleDecision = this.rulesEngine?.evaluate(userId, req, context) ?? { kind: 'noop' as const }
+    if (ruleDecision.kind === 'block') {
+      this.audit.requestBlocked({
+        userId,
+        model: req.model,
+        reason: `Rule "${ruleDecision.ruleId}": ${ruleDecision.reason}`,
+        ruleId: ruleDecision.ruleId,
+        ...(context.teamId !== undefined && { teamId: context.teamId }),
+        ...(context.orgId !== undefined && { orgId: context.orgId }),
+      })
+      this.metricsCollector.recordRequest('unknown', 0, 0, 'blocked')
+      throw new Error(`[FreeRouter] Request blocked by rule "${ruleDecision.ruleId}": ${ruleDecision.reason}`)
+    }
+
+    // ── Cost optimization (mediated by rule mode) ──
+    const optimizedModel = this.applyRuleAndCost(req, ruleDecision)
     const effectiveReq: ChatRequest = optimizedModel !== req.model
       ? { ...req, model: optimizedModel }
       : req
@@ -543,6 +643,7 @@ export class FreeRouter {
         model: req.model,
         reason: decision.blockedReason ?? 'Policy blocked',
         ...(decision.policyId !== undefined && { policyId: decision.policyId }),
+        ...(ruleDecision.kind !== 'noop' && { ruleId: ruleDecision.ruleId }),
         ...(context.teamId !== undefined && { teamId: context.teamId }),
         ...(context.orgId !== undefined && { orgId: context.orgId }),
       })
@@ -604,6 +705,7 @@ export class FreeRouter {
         ...(context.teamId !== undefined && { teamId: context.teamId }),
         ...(context.departmentId !== undefined && { departmentId: context.departmentId }),
         ...(context.orgId !== undefined && { orgId: context.orgId }),
+        ...(ruleDecision.kind !== 'noop' && { ruleId: ruleDecision.ruleId }),
       })
       this.rateLimiter?.consume(context.teamId ?? userId, finalChunk.usage.totalTokens)
     }
@@ -680,13 +782,43 @@ export class FreeRouter {
   // ── Private helpers ───────────────────────────────────────────────
 
   /**
-   * Run cost-optimal model selection before policy evaluation.
-   * Pure computation — no I/O, always sub-millisecond.
+   * Combine the admin rule decision with the cost router according to the
+   * configured `RulesMode`. Pure computation — no I/O.
    */
-  private selectCostOptimalModel(req: ChatRequest): string {
-    if (this.costRouter === undefined) return req.model
+  private applyRuleAndCost(req: ChatRequest, ruleDecision: RuleDecision): string {
     const tokens = estimatePromptTokens(req.messages)
-    return this.costRouter.selectModel(req.model, tokens, req.priority === 'realtime')
+    const isRealtime = req.priority === 'realtime'
+    const mode = this.rulesEngine?.mode ?? 'pin-wins'
+
+    // No rule matched — fall through to standard cost optimization.
+    if (ruleDecision.kind === 'noop') {
+      if (this.costRouter === undefined) return req.model
+      return this.costRouter.selectModel(req.model, tokens, isRealtime)
+    }
+
+    if (ruleDecision.kind === 'pin') {
+      if (mode === 'pin-wins') return ruleDecision.model
+      if (mode === 'narrow-candidates') {
+        // Cost router still runs but the candidate pool is just the pinned model.
+        if (this.costRouter === undefined) return ruleDecision.model
+        return this.costRouter.selectModel(req.model, tokens, isRealtime, {
+          candidateModels: [ruleDecision.model],
+        })
+      }
+      // post-override: cost router runs (for pricing accounting), then pin wins.
+      return ruleDecision.model
+    }
+
+    if (ruleDecision.kind === 'strategy') {
+      if (this.costRouter === undefined) return req.model
+      return this.costRouter.selectModel(req.model, tokens, isRealtime, {
+        strategy: ruleDecision.strategy,
+        ...(ruleDecision.candidateModels !== undefined && { candidateModels: ruleDecision.candidateModels }),
+      })
+    }
+
+    // 'block' decisions are handled upstream before reaching this helper.
+    return req.model
   }
 
   private trackInflight(providerKey: string, promise: Promise<unknown>): void {
