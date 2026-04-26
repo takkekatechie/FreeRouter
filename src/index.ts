@@ -9,7 +9,7 @@
 export { FreeRouter } from './router.js'
 
 // Config
-export type { RouterConfig, ProviderToggle } from './config.js'
+export type { RouterConfig, ProviderToggle, SpendPersistenceConfig, PricingRefreshConfig } from './config.js'
 
 // Config file loader
 export { loadConfigFile, loadConfigFromEnv, mergeConfigs, validateConfigKeys } from './config-loader.js'
@@ -42,6 +42,7 @@ export type {
   ChargebackReport,
   RateLimitConfig,
   PolicyDecision,
+  ModelPricingEntry,
 
   // Security
   AuditAction,
@@ -49,7 +50,6 @@ export type {
   AuditSink,
 
   // Hot-reload lifecycle
-  ModelPricingEntry,
   ProviderLifecycleEvent,
   ModelLifecycleEvent,
   RouterEventMap,
@@ -60,6 +60,17 @@ export type {
   LatencyBuckets,
   RouterMetrics,
 } from './types.js'
+
+// FinOps — persistence
+export type { SpendStore } from './finops/spend-store.js'
+export { MemorySpendStore } from './finops/spend-store.js'
+
+// FinOps — pricing sources
+export type { PricingSource, PricingManifest } from './finops/pricing-source.js'
+export { HttpPricingSource, StaticPricingSource } from './finops/pricing-source.js'
+
+// FinOps — cost optimization
+export type { CostOptimizationConfig, CostStrategy } from './finops/cost-router.js'
 
 // Extensibility
 export type { BaseProvider } from './providers/base-provider.js'

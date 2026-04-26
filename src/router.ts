@@ -30,7 +30,8 @@ import { ChargebackEngine } from './finops/chargeback.js'
 import { RateLimiter } from './finops/rate-limiter.js'
 import type { RateLimiterLike } from './finops/rate-limiter.js'
 import { PolicyEngine } from './finops/policy-engine.js'
-import { calculateCost } from './finops/cost-calculator.js'
+import { CostRouter } from './finops/cost-router.js'
+import { calculateCost, estimatePromptTokens } from './finops/cost-calculator.js'
 import { loadConfigFile, loadConfigFromEnv, mergeConfigs, validateConfigKeys } from './config-loader.js'
 import { TypedEventEmitter } from './router-events.js'
 import { MetricsCollector } from './metrics-collector.js'
@@ -46,6 +47,7 @@ export class FreeRouter {
   private readonly chargeback: ChargebackEngine
   private readonly rateLimiter: RateLimiterLike | undefined
   private readonly policyEngine: PolicyEngine
+  private readonly costRouter: CostRouter | undefined
   private readonly config: RouterConfig
   private readonly policies: BudgetPolicy[]
 
@@ -63,11 +65,18 @@ export class FreeRouter {
   // Plugin dedup
   private readonly installedPlugins = new Set<string>()
 
+  // Persistence & refresh
+  private spendFlushTimer: ReturnType<typeof setInterval> | undefined
+  private pricingRefreshTimer: ReturnType<typeof setInterval> | undefined
+  private readonly exitHandlers = new Map<string, () => void>()
+  private initPromise: Promise<void> | undefined
+
   // ── Static factory methods ────────────────────────────────
 
   /**
    * Create a router from a JSON/YAML/TOML config file.
    * Format is auto-detected from file extension.
+   * Automatically calls `init()` so spend history and pricing are loaded before first use.
    */
   static async fromFile(filePath: string, overrides?: Partial<RouterConfig>): Promise<FreeRouter> {
     const fileConfig = await loadConfigFile(filePath)
@@ -76,16 +85,21 @@ export class FreeRouter {
       process.stderr.write(`[FreeRouter] Warning: unknown config keys: ${unknownKeys.join(', ')}\n`)
     }
     const merged = mergeConfigs(fileConfig, overrides) as RouterConfig
-    return new FreeRouter(merged)
+    const router = new FreeRouter(merged)
+    await router.init()
+    return router
   }
 
   /**
    * Create a router from the path in FREEROUTER_CONFIG env var.
+   * Automatically calls `init()` so spend history and pricing are loaded before first use.
    */
   static async fromEnv(overrides?: Partial<RouterConfig>): Promise<FreeRouter> {
     const fileConfig = await loadConfigFromEnv()
     const merged = mergeConfigs(fileConfig, overrides) as RouterConfig
-    return new FreeRouter(merged)
+    const router = new FreeRouter(merged)
+    await router.init()
+    return router
   }
 
   constructor(config: RouterConfig = {}) {
@@ -152,13 +166,159 @@ export class FreeRouter {
       config.pricingOverrides ?? {},
     )
 
+    this.costRouter = config.costOptimization !== undefined
+      ? new CostRouter(this.registry, config.costOptimization)
+      : undefined
+
     // Seed known providers from the initial registry
     for (const name of this.registry.list()) {
       this.allKnownProviders.add(name.toLowerCase())
     }
   }
 
-  // ── Key management ────────────────────────────────────────────
+  // ── Lifecycle ─────────────────────────────────────────────────
+
+  /**
+   * Load persisted spend records from the configured SpendStore and
+   * fetch the initial pricing manifest from the configured PricingSource.
+   *
+   * Called automatically by `fromFile` and `fromEnv`.
+   * When using `new FreeRouter(config)` directly, call `await router.init()` before
+   * processing requests if you want historical spend data loaded.
+   *
+   * Safe to call multiple times — subsequent calls are no-ops.
+   */
+  async init(): Promise<void> {
+    if (this.initPromise !== undefined) {
+      await this.initPromise
+      return
+    }
+    this.initPromise = this._initialize()
+    await this.initPromise
+  }
+
+  private async _initialize(): Promise<void> {
+    // Restore persisted spend records
+    const persistence = this.config.spendPersistence
+    if (persistence !== undefined) {
+      const records = await persistence.store.load()
+      for (const r of records) this.tracker.recordSpend(r)
+
+      if (persistence.intervalMs !== undefined && persistence.intervalMs > 0) {
+        this.spendFlushTimer = setInterval(
+          () => { void this.flushSpend() },
+          persistence.intervalMs,
+        )
+        // Don't keep the process alive just for the timer
+        this.spendFlushTimer.unref?.()
+      }
+
+      // Default: register exit handlers when a store is configured
+      if (persistence.autoFlushOnExit !== false) {
+        this._registerExitHandlers()
+      }
+    }
+
+    // Load initial pricing from the configured source
+    if (this.config.pricingRefresh !== undefined) {
+      await this.refreshPricing()
+
+      const { intervalMs } = this.config.pricingRefresh
+      if (intervalMs !== undefined && intervalMs > 0) {
+        this.pricingRefreshTimer = setInterval(
+          () => { void this.refreshPricing() },
+          intervalMs,
+        )
+        this.pricingRefreshTimer.unref?.()
+      }
+    }
+  }
+
+  /**
+   * Flush current spend records to the configured SpendStore.
+   * No-op when no store is configured.
+   */
+  async flushSpend(): Promise<void> {
+    const store = this.config.spendPersistence?.store
+    if (store === undefined) return
+    await store.save(this.tracker.allRecords())
+  }
+
+  /**
+   * Fetch the latest model pricing and rate-limit caps from the configured PricingSource
+   * and apply them to the ProviderRegistry.
+   *
+   * - New models are registered via `addModelPricing`.
+   * - Existing models have their pricing updated in-place.
+   * - Advisory `rpmLimit`/`tpmLimit` fields are currently logged but not enforced
+   *   (wire them to a per-model RateLimiter to enforce).
+   *
+   * No-op when no `pricingRefresh` config is set.
+   */
+  async refreshPricing(): Promise<void> {
+    const source = this.config.pricingRefresh?.source
+    if (source === undefined) return
+
+    let manifest
+    try {
+      manifest = await source.fetch()
+    } catch (err) {
+      process.stderr.write(`[FreeRouter] PricingSource fetch failed: ${String(err)}\n`)
+      return
+    }
+
+    let updated = 0
+    for (const [providerName, models] of Object.entries(manifest)) {
+      for (const [modelId, entry] of Object.entries(models)) {
+        const pricing: ModelPricingEntry = {
+          input: entry.input,
+          output: entry.output,
+          ...(entry.cachedInput !== undefined && { cachedInput: entry.cachedInput }),
+        }
+        this.registry.addModelPricing(providerName, modelId, pricing)
+        updated++
+      }
+    }
+
+    this.config.onPricingRefreshed?.(updated)
+  }
+
+  /**
+   * Graceful shutdown: flush spend records, clear all intervals, and remove
+   * process signal listeners registered by this router instance.
+   *
+   * Always call this before process exit when using SpendStore persistence
+   * to guarantee no spend data is lost.
+   */
+  async shutdown(): Promise<void> {
+    if (this.spendFlushTimer !== undefined) {
+      clearInterval(this.spendFlushTimer)
+      this.spendFlushTimer = undefined
+    }
+    if (this.pricingRefreshTimer !== undefined) {
+      clearInterval(this.pricingRefreshTimer)
+      this.pricingRefreshTimer = undefined
+    }
+    await this.flushSpend()
+    for (const [signal, handler] of this.exitHandlers) {
+      process.removeListener(signal, handler)
+    }
+    this.exitHandlers.clear()
+  }
+
+  private _registerExitHandlers(): void {
+    for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+      if (this.exitHandlers.has(signal)) continue
+      const handler = () => {
+        // Synchronously initiate shutdown; exit after flush completes
+        void this.shutdown().finally(() => { process.exit(0) })
+      }
+      process.on(signal, handler)
+      this.exitHandlers.set(signal, handler)
+    }
+  }
+
+  // ── Key management ────────────────────────────────────────────────
 
   setKey(userId: string, provider: string, key: string, context?: RequestContext): void {
     this.keyManager.setKey(userId, provider, key)
@@ -175,7 +335,7 @@ export class FreeRouter {
     this.audit.keyDeleted(userId, provider)
   }
 
-  // ── Hot-reload: Providers ─────────────────────────────────────
+  // ── Hot-reload: Providers ─────────────────────────────────────────
 
   /**
    * Subscribe to router lifecycle events.
@@ -232,7 +392,7 @@ export class FreeRouter {
     this.events.emit('provider:removed', { providerName: key, timestamp: Date.now() })
   }
 
-  // ── Hot-reload: Models ────────────────────────────────────────
+  // ── Hot-reload: Models ────────────────────────────────────────────
 
   /** Register a new model (and pricing) on an existing provider at runtime. */
   addModel(providerName: string, modelId: string, pricing: ModelPricingEntry): void {
@@ -243,7 +403,7 @@ export class FreeRouter {
   }
 
   /**
-   * Disallow routing to a model at runtime.
+   * Disallow routing to a model at runtime and remove its pricing entry.
    * Future requests for this model throw. Historical spend records remain.
    */
   removeModel(providerName: string, modelId: string): void {
@@ -253,12 +413,49 @@ export class FreeRouter {
     this.events.emit('model:removed', { providerName: key, modelId, timestamp: Date.now() })
   }
 
-  // ── Chat (non-streaming) ──────────────────────────────────────
+  /**
+   * Admin-level model block: prevents routing to a model without removing its
+   * pricing history. Reversible via `unblockModel`.
+   *
+   * Useful for compliance holds, deprecation notices, or temporary capacity limits.
+   */
+  blockModel(providerName: string, modelId: string): void {
+    this.registry.blockModel(providerName, modelId)
+    this.audit.modelRemoved(providerName.toLowerCase(), modelId)
+  }
+
+  /** Re-allow routing to a model that was blocked via `blockModel`. */
+  unblockModel(providerName: string, modelId: string): void {
+    this.registry.unblockModel(providerName, modelId)
+    this.audit.modelAdded(providerName.toLowerCase(), modelId)
+  }
+
+  /**
+   * Override pricing for a specific model at runtime.
+   * Accepts manual entry or a file path to a `PricingManifest` JSON.
+   *
+   * @example Manual override
+   * router.setPricingOverride('openai', 'gpt-4o', { input: 2.50, output: 10.0, cachedInput: 1.25 })
+   *
+   * @example File-based override (async)
+   * await router.setPricingOverrideFromFile('./config/pricing.json')
+   */
+  setPricingOverride(providerName: string, modelId: string, pricing: ModelPricingEntry): void {
+    this.registry.addModelPricing(providerName.toLowerCase(), modelId, pricing)
+  }
+
+  // ── Chat (non-streaming) ──────────────────────────────────────────
 
   async chat(userId: string, req: ChatRequest, context: RequestContext = {}): Promise<ChatResponse> {
     this.validator.validate(req)
 
-    const decision = this.policyEngine.evaluate(userId, req, context)
+    // ── Cost optimization: select cheaper model before policy evaluation ──
+    const optimizedModel = this.selectCostOptimalModel(req)
+    const effectiveReq: ChatRequest = optimizedModel !== req.model
+      ? { ...req, model: optimizedModel }
+      : req
+
+    const decision = this.policyEngine.evaluate(userId, effectiveReq, context)
     if (!decision.allowed) {
       this.audit.requestBlocked({
         userId,
@@ -272,7 +469,7 @@ export class FreeRouter {
       throw new Error(`[FreeRouter] Request blocked: ${decision.blockedReason}`)
     }
 
-    const effectiveReq: ChatRequest = { ...req, model: decision.effectiveModel }
+    const finalReq: ChatRequest = { ...effectiveReq, model: decision.effectiveModel }
     const { provider, modelName } = this.registry.resolveFromModel(
       decision.effectiveModel,
       this.config.defaultProvider,
@@ -290,7 +487,7 @@ export class FreeRouter {
     const providerKey = provider.name.toLowerCase()
 
     const requestPromise = this.keyManager.withKey(userId, provider.name, async apiKey => {
-      response = await provider.chat(effectiveReq, apiKey)
+      response = await provider.chat(finalReq, apiKey)
     })
 
     this.trackInflight(providerKey, requestPromise)
@@ -328,12 +525,18 @@ export class FreeRouter {
     return response
   }
 
-  // ── Chat (streaming) ──────────────────────────────────────────
+  // ── Chat (streaming) ──────────────────────────────────────────────
 
   async *chatStream(userId: string, req: ChatRequest, context: RequestContext = {}): AsyncGenerator<StreamChunk> {
     this.validator.validate(req)
 
-    const decision = this.policyEngine.evaluate(userId, req, context)
+    // ── Cost optimization ──
+    const optimizedModel = this.selectCostOptimalModel(req)
+    const effectiveReq: ChatRequest = optimizedModel !== req.model
+      ? { ...req, model: optimizedModel }
+      : req
+
+    const decision = this.policyEngine.evaluate(userId, effectiveReq, context)
     if (!decision.allowed) {
       this.audit.requestBlocked({
         userId,
@@ -347,7 +550,7 @@ export class FreeRouter {
       throw new Error(`[FreeRouter] Request blocked: ${decision.blockedReason}`)
     }
 
-    const effectiveReq: ChatRequest = { ...req, model: decision.effectiveModel }
+    const finalReq: ChatRequest = { ...effectiveReq, model: decision.effectiveModel }
     const { provider, modelName } = this.registry.resolveFromModel(
       decision.effectiveModel,
       this.config.defaultProvider,
@@ -366,7 +569,7 @@ export class FreeRouter {
     // Collect chunks inside callback (yield cannot cross async callback boundary)
     const chunks: StreamChunk[] = []
     const requestPromise = this.keyManager.withKey(userId, provider.name, async apiKey => {
-      for await (const chunk of provider.chatStream(effectiveReq, apiKey)) {
+      for await (const chunk of provider.chatStream(finalReq, apiKey)) {
         chunks.push(chunk)
       }
     })
@@ -409,7 +612,7 @@ export class FreeRouter {
     this.rateLimiter?.prune()
   }
 
-  // ── FinOps API ────────────────────────────────────────────────
+  // ── FinOps API ────────────────────────────────────────────────────
 
   addBudgetPolicy(policy: BudgetPolicy): void { this.policies.push(policy) }
 
@@ -425,7 +628,7 @@ export class FreeRouter {
     return this.chargeback.generateReport(scope, start, end)
   }
 
-  // ── Extension ─────────────────────────────────────────────────
+  // ── Extension ─────────────────────────────────────────────────────
 
   registerProvider(provider: BaseProvider): void { this.registry.register(provider) }
 
@@ -445,7 +648,7 @@ export class FreeRouter {
     return this
   }
 
-  // ── Health & Metrics ──────────────────────────────────────────
+  // ── Health & Metrics ──────────────────────────────────────────────
 
   healthCheck(): HealthStatus {
     // Combine active providers and known-but-removed providers for full picture
@@ -474,7 +677,17 @@ export class FreeRouter {
     return this.metricsCollector.snapshot()
   }
 
-  // ── Private helpers ───────────────────────────────────────────
+  // ── Private helpers ───────────────────────────────────────────────
+
+  /**
+   * Run cost-optimal model selection before policy evaluation.
+   * Pure computation — no I/O, always sub-millisecond.
+   */
+  private selectCostOptimalModel(req: ChatRequest): string {
+    if (this.costRouter === undefined) return req.model
+    const tokens = estimatePromptTokens(req.messages)
+    return this.costRouter.selectModel(req.model, tokens, req.priority === 'realtime')
+  }
 
   private trackInflight(providerKey: string, promise: Promise<unknown>): void {
     let set = this.inflight.get(providerKey)
@@ -509,6 +722,9 @@ export class FreeRouter {
       tokens: response.usage,
       costUsd,
       timestamp: Date.now(),
+      ...(response.usage.cachedPromptTokens !== undefined && {
+        cachedPromptTokens: response.usage.cachedPromptTokens,
+      }),
     }
   }
 
@@ -533,6 +749,9 @@ export class FreeRouter {
       tokens: usage,
       costUsd,
       timestamp: Date.now(),
+      ...(usage.cachedPromptTokens !== undefined && {
+        cachedPromptTokens: usage.cachedPromptTokens,
+      }),
     }
   }
 }

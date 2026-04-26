@@ -19,6 +19,12 @@ export interface ChatRequest {
   temperature?: number
   maxTokens?: number
   stream?: boolean
+  /**
+   * Request priority hint used by the CostRouter and rate limiter.
+   * - 'realtime'  (default) — latency-sensitive; bypasses cost optimization when batchOnly is set.
+   * - 'batch'     — non-latency-sensitive; eligible for model downgrade to a cheaper candidate.
+   */
+  priority?: 'realtime' | 'batch'
   /** Pass-through extras forwarded verbatim to the provider */
   metadata?: Record<string, unknown>
 }
@@ -27,6 +33,8 @@ export interface TokenUsage {
   promptTokens: number
   completionTokens: number
   totalTokens: number
+  /** Tokens served from the provider's prompt cache (subset of promptTokens). */
+  cachedPromptTokens?: number
 }
 
 export interface ChatResponse {
@@ -118,6 +126,8 @@ export interface SpendRecord {
   tokens: TokenUsage
   costUsd: number
   timestamp: number // epoch ms
+  /** Tokens served from provider cache — used to compute actual (discounted) cost. */
+  cachedPromptTokens?: number
 }
 
 export interface SpendForecast {
@@ -223,6 +233,12 @@ export interface AuditSink {
 export interface ModelPricingEntry {
   input: number
   output: number
+  /**
+   * Price for prompt tokens served from the provider's cache (USD / 1M tokens).
+   * Defaults to `input` when absent (no cache discount).
+   * Anthropic: ~10 % of input. OpenAI: ~50 % of input.
+   */
+  cachedInput?: number
 }
 
 export interface ProviderLifecycleEvent {

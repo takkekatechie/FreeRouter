@@ -115,17 +115,38 @@ export class ProviderRegistry {
   }
 
   /**
-   * Disallow routing to a specific model.
+   * Disallow routing to a specific model and remove its runtime pricing entry.
    * Existing spend records are unaffected; future requests for this model throw.
    */
   removeModelPricing(providerName: string, modelId: string): void {
     const key = providerName.toLowerCase()
     const modelLower = modelId.toLowerCase()
     this.runtimePricing.get(key)?.delete(modelLower)
-    let disallowed = this.disallowedModels.get(key)
+    this._disallow(key, modelLower)
+  }
+
+  /**
+   * Block routing to a model without removing its pricing entry.
+   * Use this for admin-level access control — pricing history is preserved for
+   * reporting and can be restored with `unblockModel`.
+   */
+  blockModel(providerName: string, modelId: string): void {
+    this._disallow(providerName.toLowerCase(), modelId.toLowerCase())
+  }
+
+  /**
+   * Re-allow routing to a previously blocked model.
+   * Does NOT re-add the model if its pricing entry was removed via `removeModelPricing`.
+   */
+  unblockModel(providerName: string, modelId: string): void {
+    this.disallowedModels.get(providerName.toLowerCase())?.delete(modelId.toLowerCase())
+  }
+
+  private _disallow(providerKey: string, modelLower: string): void {
+    let disallowed = this.disallowedModels.get(providerKey)
     if (disallowed === undefined) {
       disallowed = new Set()
-      this.disallowedModels.set(key, disallowed)
+      this.disallowedModels.set(providerKey, disallowed)
     }
     disallowed.add(modelLower)
   }

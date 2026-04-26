@@ -7,12 +7,46 @@ import type {
   SpendRecord,
   SpendSummary,
 } from './types.js'
+import type { SpendStore } from './finops/spend-store.js'
+import type { PricingSource } from './finops/pricing-source.js'
+import type { CostOptimizationConfig } from './finops/cost-router.js'
 
 export interface ProviderToggle {
   /** Set to false to skip registering this built-in provider. Default: true */
   enabled?: boolean
   /** Override default model-prefix routing for this provider */
   routingPrefixes?: string[]
+}
+
+export interface SpendPersistenceConfig {
+  /**
+   * Storage backend for SpendTracker records.
+   * Use `FileSpendStore` for single-process deployments.
+   * Implement `SpendStore` for custom backends (Redis, Postgres, S3, etc.).
+   */
+  store: SpendStore
+  /**
+   * Auto-flush interval in milliseconds.
+   * Set to 0 or omit to disable scheduled flushing (ad-hoc only via `router.flushSpend()`).
+   * Recommended: 60_000 (1 min) for production workloads.
+   */
+  intervalMs?: number
+  /**
+   * Register SIGINT / SIGTERM handlers that call `router.shutdown()` before exit.
+   * Default: true when `store` is set.
+   */
+  autoFlushOnExit?: boolean
+}
+
+export interface PricingRefreshConfig {
+  /** Source that provides the latest model pricing and rate-limit caps. */
+  source: PricingSource
+  /**
+   * How often to re-fetch from the source (ms).
+   * Set to 0 or omit to disable automatic refresh (manual via `router.refreshPricing()`).
+   * Recommended: 3_600_000 (1 hour).
+   */
+  intervalMs?: number
 }
 
 export interface RouterConfig {
@@ -83,12 +117,32 @@ export interface RouterConfig {
   /** Override provider pricing (USD per 1 M tokens) */
   pricingOverrides?: Record<
     string,
-    { input: number; output: number }
+    { input: number; output: number; cachedInput?: number }
   >
+
+  /**
+   * Persist SpendTracker records across restarts.
+   * Records are loaded on `router.init()` and saved on schedule / shutdown.
+   */
+  spendPersistence?: SpendPersistenceConfig
+
+  /**
+   * Automatically select a cheaper candidate model for eligible requests.
+   * Runs in pure in-memory computation — zero I/O, sub-millisecond overhead.
+   */
+  costOptimization?: CostOptimizationConfig
+
+  /**
+   * Fetch the latest model pricing and rate-limit caps from an external source.
+   * Fetched data is applied to the ProviderRegistry via `addModelPricing`.
+   */
+  pricingRefresh?: PricingRefreshConfig
 
   // ─── Lifecycle hooks ─────────────────────────────────────────
   onBudgetWarning?: (scope: BudgetScope, spend: SpendSummary) => void
   onBudgetExceeded?: (scope: BudgetScope, spend: SpendSummary) => void
   onForecastAtRisk?: (scope: BudgetScope, forecast: SpendForecast) => void
   onRequestComplete?: (record: SpendRecord) => void
+  /** Called after each successful pricing refresh with the number of models updated. */
+  onPricingRefreshed?: (updatedCount: number) => void
 }
