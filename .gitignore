@@ -1,0 +1,11 @@
+.DS_Store
+**/.DS_Store
+node_modules/
+dist/
+.env
+.env.local
+.claude/
+.adminkey
+docs/build_pptx.py
+docs/FinOps-Presentation.html
+docs/~$Freerouter-FinOps-Presentation.pptx

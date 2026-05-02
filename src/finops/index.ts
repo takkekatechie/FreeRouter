@@ -9,7 +9,14 @@ export { CostRouter } from './cost-router.js'
 export type { CostOptimizationConfig, CostStrategy } from './cost-router.js'
 export type { SpendStore } from './spend-store.js'
 export { MemorySpendStore } from './spend-store.js'
-export type { PricingSource, PricingManifest } from './pricing-source.js'
-export { HttpPricingSource, StaticPricingSource } from './pricing-source.js'
+export type {
+  PricingSource, PricingManifest, PricingTransform, HttpPricingSourceOptions,
+} from './pricing-source.js'
+export {
+  HttpPricingSource, StaticPricingSource,
+  transformLiteLLM, transformOpenRouter,
+  liteLLMPricingSource, openRouterPricingSource,
+  LITELLM_PRICING_URL, OPENROUTER_PRICING_URL,
+} from './pricing-source.js'
 export { RulesEngine } from './rules-engine.js'
 export type { Rule, RuleAction, RuleMatch, RuleDecision, RulesConfig, RulesMode } from './rules-engine.js'
